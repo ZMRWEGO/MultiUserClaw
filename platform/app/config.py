@@ -1,6 +1,6 @@
 """Platform gateway configuration."""
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     dashscope_api_key: str = ""
     aihubmix_api_key: str = ""
     moonshot_api_key: str = ""
+    moonshot_api_base: str = ""  # e.g. "https://api.moonshot.cn/v1"
     zhipu_api_key: str = ""
 
     # Self-hosted vLLM / OpenAI-compatible local model
@@ -60,7 +61,7 @@ class Settings(BaseSettings):
     # Local dev: set to e.g. "http://127.0.0.1:18080" to skip Docker containers
     dev_nanobot_url: str = ""
 
-    model_config = {"env_prefix": "PLATFORM_"}
+    model_config = SettingsConfigDict(env_prefix="PLATFORM_")
 
 
 settings = Settings()

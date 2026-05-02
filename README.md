@@ -137,6 +137,10 @@ OPENROUTER_API_KEY=sk-or-xxxxxxxxxxxx
 # AiHubMix
 AIHUBMIX_API_KEY=sk-xxxxxxxxxxxx
 
+# Moonshot（Kimi 系列）
+MOONSHOT_API_KEY=sk-xxxxxxxxxxxx
+# MOONSHOT_API_BASE=https://api.moonshot.cn/v1  # 可选，默认 https://api.moonshot.ai/v1
+
 # ========== 可选配置 ==========
 
 # 默认模型（新用户容器使用此模型）
@@ -157,6 +161,7 @@ JWT_SECRET=your-secure-random-string
 | OpenAI | `gpt-4o`, `gpt-4o-mini`, `o3-mini` | `OPENAI_API_KEY` |
 | DeepSeek | `deepseek/deepseek-chat`, `deepseek/deepseek-reasoner` | `DEEPSEEK_API_KEY` |
 | AiHubMix | `aihubmix/模型名` | `AIHUBMIX_API_KEY` |
+| Moonshot | `moonshot/kimi-k2.5`, `moonshot/kimi-latest` | `MOONSHOT_API_KEY` |
 | OpenRouter | `openrouter/任意模型`（兜底） | `OPENROUTER_API_KEY` |
 
 Gateway 根据模型名自动匹配提供商并注入对应的 API Key，用户容器内不存储任何密钥。
@@ -198,6 +203,12 @@ docker build -t nanobot:latest .
 
 # 2. 构建并启动所有服务
 docker compose up -d --build
+
+# 单独构建 gateway（修改 platform 代码后）
+docker compose up -d --build gateway
+
+# 单独构建 frontend（修改前端代码后）
+docker compose up -d --build frontend
 
 # 查看日志
 docker compose logs -f

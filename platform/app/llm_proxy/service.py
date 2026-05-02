@@ -8,6 +8,7 @@ quotas, and forwards to the actual LLM provider.
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
+from typing import Any
 
 from fastapi import HTTPException, status
 from litellm import acompletion
@@ -41,6 +42,17 @@ _CUSTOM_BASE_PROVIDERS: dict[str, tuple[str, str]] = {
     "aihubmix": ("https://aihubmix.com/v1", "aihubmix_api_key"),
 }
 
+# Provider-specific extra headers injected at proxy layer
+_PROVIDER_HEADERS: dict[str, dict[str, str]] = {
+    "moonshot": {"User-Agent": "claude-code/1.0"},
+}
+
+# Model-specific parameter overrides (e.g. kimi-k2.5 temperature)
+_MODEL_OVERRIDES: list[tuple[str, dict[str, Any]]] = [
+    ("kimi-k2.5", {"temperature": 1.0}),
+    ("kimi-for-coding", {"temperature": 0.6}),
+]
+
 
 def _resolve_provider(model: str) -> tuple[str, str, str | None]:
     """Return (litellm_model_name, api_key, api_base_or_None) for the given model."""
@@ -66,7 +78,11 @@ def _resolve_provider(model: str) -> tuple[str, str, str | None]:
             api_key = getattr(settings, key_attr, "")
             if api_key:
                 litellm_model = f"{prefix}/{model}" if prefix else model
-                return litellm_model, api_key, None
+                api_base = None
+                # Moonshot supports custom api_base (e.g. api.moonshot.cn)
+                if keyword == "moonshot" and settings.moonshot_api_base:
+                    api_base = settings.moonshot_api_base
+                return litellm_model, api_key, api_base
 
     # Fallback: OpenRouter (routes any model)
     if settings.openrouter_api_key:
@@ -76,6 +92,24 @@ def _resolve_provider(model: str) -> tuple[str, str, str | None]:
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail=f"No provider configured for model '{model}'",
     )
+
+
+def _apply_model_overrides(model: str, kwargs: dict[str, Any]) -> None:
+    """Apply model-specific parameter overrides from registry."""
+    model_lower = model.lower()
+    for pattern, overrides in _MODEL_OVERRIDES:
+        if pattern in model_lower:
+            kwargs.update(overrides)
+            return
+
+
+def _get_extra_headers(model: str) -> dict[str, str] | None:
+    """Return provider-specific extra headers for the given model."""
+    model_lower = model.lower()
+    for keyword, headers in _PROVIDER_HEADERS.items():
+        if keyword in model_lower:
+            return headers
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +190,14 @@ async def proxy_chat_completion(
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
+
+    # Apply model-specific parameter overrides (e.g. kimi-k2.5 temperature)
+    _apply_model_overrides(model, kwargs)
+
+    # Apply provider-specific extra headers (e.g. moonshot User-Agent)
+    extra_headers = _get_extra_headers(model)
+    if extra_headers:
+        kwargs["extra_headers"] = extra_headers
 
     try:
         response = await acompletion(**kwargs)

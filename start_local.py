@@ -113,6 +113,7 @@ def _base_env(**extra) -> dict:
     env = {**os.environ}
     if IS_WINDOWS:
         env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
     env.update(extra)
     return env
 

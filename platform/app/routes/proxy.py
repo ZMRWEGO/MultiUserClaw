@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
@@ -21,11 +22,16 @@ router = APIRouter(prefix="/api/nanobot", tags=["proxy"])
 
 async def _container_url(db: AsyncSession, user: User) -> str:
     """Get the internal URL for the user's nanobot container, starting it if needed."""
+    logger.info("[_container_url] dev_nanobot_url={}", settings.dev_nanobot_url)
     # Local dev mode: bypass Docker, forward to local nanobot web directly
     if settings.dev_nanobot_url:
+        logger.info("[_container_url] local dev mode -> {}", settings.dev_nanobot_url)
         return settings.dev_nanobot_url
+    logger.info("[_container_url] docker mode for user={}", user.id)
     container = await ensure_running(db, user.id)
-    return f"http://{container.internal_host}:{container.internal_port}"
+    url = f"http://{container.internal_host}:{container.internal_port}"
+    logger.info("[_container_url] docker container -> {}", url)
+    return url
 
 
 # ---------------------------------------------------------------------------
@@ -40,12 +46,14 @@ async def proxy_http(
     db: AsyncSession = Depends(get_db),
 ):
     """Forward HTTP requests to the user's nanobot container."""
+    logger.info("[proxy_http] path={} user={}", path, user.id)
     base_url = await _container_url(db, user)
     # Close the session explicitly so the connection returns to the pool
     # before the potentially long upstream call (up to 120s).
     await db.close()
 
     target_url = f"{base_url}/api/{path}"
+    logger.info("[proxy_http] target_url={}", target_url)
 
     # Forward query params
     if request.query_params:
@@ -61,11 +69,16 @@ async def proxy_http(
                 content=body,
                 headers={"content-type": request.headers.get("content-type", "application/json")},
             )
-        except httpx.ConnectError:
+            logger.info("[proxy_http] resp status={} ct={}", resp.status_code, resp.headers.get("content-type", ""))
+        except httpx.ConnectError as e:
+            logger.error("[proxy_http] ConnectError to {}: {}", target_url, e)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Nanobot container is starting up, please retry in a few seconds",
+                detail=f"ConnectError to {target_url}. dev_url={settings.dev_nanobot_url!r}",
             )
+        except Exception as e:
+            logger.error("[proxy_http] other error: {} {}", type(e).__name__, e)
+            raise
 
     ct = resp.headers.get("content-type", "")
     if ct.startswith("application/json"):

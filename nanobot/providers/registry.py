@@ -333,6 +333,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(
             ("kimi-k2.5", {"temperature": 1.0}),
+            ("kimi-for-coding", {"temperature": 0.6}),
         ),
     ),
 
