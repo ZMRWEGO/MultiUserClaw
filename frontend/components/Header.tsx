@@ -4,6 +4,7 @@ import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { MessageSquare, Activity, Clock, Puzzle, Blocks, LogOut, HelpCircle, FolderOpen, Store } from 'lucide-react';
+import ThemeToggle from '@/components/ThemeToggle';
 import { useChatStore } from '@/lib/store';
 import { logout } from '@/lib/api';
 
@@ -111,6 +112,9 @@ const Header = () => {
               })}
               <div className="ml-3 pl-3 border-l border-border">
                 <ConnectionDot />
+              </div>
+              <div className="ml-3 pl-3 border-l border-border">
+                <ThemeToggle />
               </div>
               <div className="ml-3 pl-3 border-l border-border">
                 <UserMenu />

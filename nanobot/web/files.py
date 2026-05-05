@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import quote
 
 
@@ -256,4 +257,154 @@ def create_workspace_dir(workspace: Path, rel_path: str) -> dict[str, Any]:
         "name": target.name,
         "path": str(target.relative_to(workspace)),
         "type": "directory",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Workspace file search (for chat input @-mention picker)
+# ---------------------------------------------------------------------------
+
+# Directories to skip when walking workspace for search candidates. Same list
+# used by `WorkspaceWatcher` so users get consistent behavior across features.
+_NOISE_DIRS = frozenset({
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".next",
+})
+
+_QUERY_MAX_LEN = 100
+_LIMIT_MAX = 50
+_LIMIT_DEFAULT = 20
+
+
+def _fuzzy_match(needle: str, haystack: str) -> bool:
+    """Return True if every char of needle appears in haystack in order."""
+    if not needle:
+        return True
+    i = 0
+    for c in haystack:
+        if c == needle[i]:
+            i += 1
+            if i == len(needle):
+                return True
+    return False
+
+
+def _match_score(name: str, path: str, q: str) -> int | None:
+    """Rank a candidate against query. Lower is better. None = no match.
+
+    Tiers (rank ascending = better):
+      0 name-prefix       (q='rep' → 'report.md')
+      1 name-substring    (q='ort' → 'report.md')
+      2 path-prefix       (q='docs/' → 'docs/foo.md')
+      3 path-substring    (q='ort' → 'docs/report.md' when name didn't match)
+      4 fuzzy             (q='rpm' → 'report.md')
+    Empty query yields rank=99 (sorted purely by mtime later).
+    """
+    if not q:
+        return 99
+    n_lower = name.lower()
+    p_lower = path.lower()
+    if n_lower.startswith(q):
+        return 0
+    if q in n_lower:
+        return 1
+    if p_lower.startswith(q):
+        return 2
+    if q in p_lower:
+        return 3
+    if _fuzzy_match(q, n_lower) or _fuzzy_match(q, p_lower):
+        return 4
+    return None
+
+
+def _iter_preview_files(workspace: Path) -> Iterator[dict]:
+    """Walk workspace, yielding dicts for every preview-able file.
+
+    - Prunes hidden dirs (starting with '.') and entries in `_NOISE_DIRS`.
+    - Skips hidden files (starting with '.').
+    - Skips files whose `preview_kind` is 'binary'.
+    - Skips files that fail to stat (race with deletion).
+    """
+    from nanobot.web.preview import preview_kind_for
+
+    workspace_resolved = workspace.resolve()
+
+    for root, dirs, files in os.walk(workspace_resolved, followlinks=False):
+        # In-place prune: hidden + noise dirs are never recursed into.
+        dirs[:] = [
+            d for d in dirs
+            if not d.startswith(".") and d not in _NOISE_DIRS
+        ]
+        root_path = Path(root)
+        for fname in files:
+            if fname.startswith("."):
+                continue
+            fpath = root_path / fname
+            try:
+                kind, _ = preview_kind_for(fpath)
+            except Exception:
+                continue
+            if kind == "binary":
+                continue
+            try:
+                stat = fpath.stat()
+            except OSError:
+                continue
+            try:
+                rel = fpath.relative_to(workspace_resolved).as_posix()
+            except ValueError:
+                continue
+            ct, _ = mimetypes.guess_type(fname)
+            yield {
+                "name": fname,
+                "path": rel,
+                "size": stat.st_size,
+                "content_type": ct or "application/octet-stream",
+                "modified": datetime.fromtimestamp(
+                    stat.st_mtime, tz=timezone.utc
+                ).isoformat(),
+                "preview_kind": kind,
+                "_mtime_ts": stat.st_mtime,
+            }
+
+
+def search_workspace_files(
+    workspace: Path,
+    query: str = "",
+    limit: int = _LIMIT_DEFAULT,
+) -> dict[str, Any]:
+    """Return the top-N preview-able files matching `query`.
+
+    Sorted by `(rank asc, mtime desc)`. Ranks: see `_match_score`.
+    `query` is trimmed and lowercased; length capped to 100.
+    `limit` is clamped to `[1, 50]`.
+    """
+    q = (query or "").strip().lower()[:_QUERY_MAX_LEN]
+    limit = max(1, min(_LIMIT_MAX, limit))
+
+    matches: list[tuple[int, float, dict]] = []
+    for item in _iter_preview_files(workspace):
+        score = _match_score(item["name"], item["path"], q)
+        if score is None:
+            continue
+        # Negate mtime so that higher mtime sorts first under ascending sort.
+        matches.append((score, -item["_mtime_ts"], item))
+
+    matches.sort(key=lambda t: (t[0], t[1]))
+    total = len(matches)
+    truncated = total > limit
+    items = [m[2] for m in matches[:limit]]
+    for it in items:
+        it.pop("_mtime_ts", None)
+
+    return {
+        "items": items,
+        "total": total,
+        "truncated": truncated,
     }

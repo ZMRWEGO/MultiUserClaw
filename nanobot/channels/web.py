@@ -47,6 +47,7 @@ class WebChannel(BaseChannel):
         # session_id -> set of connected WebSocket instances
         self._connections: dict[str, set[WebSocket]] = {}
         self._server: Any = None  # uvicorn.Server, set in start()
+        self._watcher: Any = None  # WorkspaceWatcher, set in start()
 
     async def start(self) -> None:
         """Start the FastAPI/uvicorn server as an async task."""
@@ -61,6 +62,7 @@ class WebChannel(BaseChannel):
             return
 
         from nanobot.web.server import create_app
+        from nanobot.web.watcher import WorkspaceWatcher
 
         app = create_app(
             bus=self.bus,
@@ -69,6 +71,11 @@ class WebChannel(BaseChannel):
             config=self.full_config,
             cron_service=self.cron_service,
         )
+
+        # Construct (but don't start) workspace watcher; lazy starts on first WS subscriber.
+        if self.full_config is not None:
+            self._watcher = WorkspaceWatcher(self.full_config.workspace_path)
+            app.state.workspace_watcher = self._watcher
 
         uvi_config = uvicorn.Config(
             app,
@@ -82,6 +89,13 @@ class WebChannel(BaseChannel):
     async def stop(self) -> None:
         """Close all WebSocket connections and stop the server."""
         self._running = False
+        # Stop workspace watcher first to release inotify resources
+        if self._watcher is not None:
+            try:
+                self._watcher.stop()
+            except Exception:
+                pass
+            self._watcher = None
         # Signal uvicorn to exit
         if self._server is not None:
             self._server.should_exit = True
