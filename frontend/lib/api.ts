@@ -699,6 +699,283 @@ export function getWorkspaceDownloadUrl(path: string): string {
   return `${API_URL}/api/nanobot/workspace/download?path=${encodeURIComponent(path)}`;
 }
 
+/**
+ * Download a workspace file or directory (directories are returned as zip).
+ * Uses fetch with auth header, then triggers a browser download via a blob URL.
+ */
+export async function downloadWorkspacePath(path: string): Promise<void> {
+  const url = getWorkspaceDownloadUrl(path);
+  const token = getAccessToken();
+  const headers: Record<string, string> = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch(url, { headers });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Download failed: ${res.status} ${text}`);
+  }
+
+  const blob = await res.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  // Try to extract filename from Content-Disposition, fall back to path basename
+  const cd = res.headers.get('content-disposition');
+  // Supports both: filename="name"  and  filename*=UTF-8''name
+  const matchUtf8 = cd?.match(/filename\*=UTF-8''(.+?)(?:;|$)/);
+  const matchPlain = cd?.match(/filename="(.+?)"/);
+  const filename = matchUtf8
+    ? decodeURIComponent(matchUtf8[1])
+    : matchPlain
+      ? matchPlain[1]
+      : path.split('/').pop() || 'download';
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+}
+
+// ---------------------------------------------------------------------------
+// Workspace folder archive (zip job)
+// ---------------------------------------------------------------------------
+
+export type ArchiveStatus = 'pending' | 'running' | 'ready' | 'failed';
+
+export interface ArchiveJob {
+  job_id: string;
+  status: ArchiveStatus;
+}
+
+export interface ArchiveStatusResponse {
+  status: ArchiveStatus;
+  bytes_written: number;
+  total_bytes_estimate: number;
+  error: string | null;
+}
+
+export async function createWorkspaceArchive(path: string): Promise<ArchiveJob> {
+  return fetchJSON<ArchiveJob>('/api/nanobot/workspace/archive', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  });
+}
+
+export async function getWorkspaceArchiveStatus(
+  jobId: string,
+): Promise<ArchiveStatusResponse> {
+  return fetchJSON<ArchiveStatusResponse>(
+    `/api/nanobot/workspace/archive/${encodeURIComponent(jobId)}`,
+  );
+}
+
+/**
+ * Fetch the archive zip and trigger a browser download.
+ * `filename` is used as the suggested filename when Content-Disposition is missing.
+ */
+export async function downloadWorkspaceArchive(
+  jobId: string,
+  filename: string,
+): Promise<void> {
+  const url = `${API_URL}/api/nanobot/workspace/archive/${encodeURIComponent(
+    jobId,
+  )}/download`;
+  const token = getAccessToken();
+  const headers: Record<string, string> = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch(url, { headers });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Archive download failed: ${res.status} ${text}`);
+  }
+
+  const blob = await res.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  const cd = res.headers.get('content-disposition');
+  const matchUtf8 = cd?.match(/filename\*=UTF-8''(.+?)(?:;|$)/);
+  const matchPlain = cd?.match(/filename="(.+?)"/);
+  a.download = matchUtf8
+    ? decodeURIComponent(matchUtf8[1])
+    : matchPlain
+      ? matchPlain[1]
+      : filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+}
+
+export interface ArchiveProgressCallbacks {
+  /** Called once before the POST request fires. */
+  onStart?: () => void;
+  /** Called on each polling tick with the latest status. */
+  onProgress?: (s: ArchiveStatusResponse) => void;
+  /** Called after the browser download has been triggered. */
+  onSuccess?: () => void;
+  /** Called if the job fails or any step throws. `message` is the error text. */
+  onError?: (message: string) => void;
+}
+
+/**
+ * High-level orchestrator: create an archive job, poll status (1s),
+ * then trigger the browser download once the zip is ready.
+ *
+ * `path` is workspace-relative; the suggested zip filename is `<basename>.zip`.
+ * Errors are surfaced via `callbacks.onError` and re-thrown so callers may
+ * react if they want to.
+ */
+export async function archiveWorkspacePath(
+  path: string,
+  callbacks: ArchiveProgressCallbacks = {},
+): Promise<void> {
+  const { onStart, onProgress, onSuccess, onError } = callbacks;
+  const basename = path.split('/').pop() || 'archive';
+  try {
+    onStart?.();
+    const job = await createWorkspaceArchive(path);
+
+    // Poll until ready or failed.
+    while (true) {
+      const status = await getWorkspaceArchiveStatus(job.job_id);
+      onProgress?.(status);
+      if (status.status === 'ready') break;
+      if (status.status === 'failed') {
+        throw new Error(status.error || '压缩失败');
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+    }
+
+    await downloadWorkspaceArchive(job.job_id, `${basename}.zip`);
+    onSuccess?.();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    onError?.(msg);
+    throw e;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace File Search (chat input @-mention)
+// ---------------------------------------------------------------------------
+
+export type PreviewKind =
+  | 'text'
+  | 'markdown'
+  | 'json'
+  | 'image'
+  | 'pdf'
+  | 'html'
+  | 'docx'
+  | 'xlsx';
+
+export interface WorkspaceFile {
+  name: string;
+  path: string;
+  size: number;
+  content_type: string;
+  modified: string;
+  preview_kind: PreviewKind;
+}
+
+export interface FilesSearchResult {
+  items: WorkspaceFile[];
+  total: number;
+  truncated: boolean;
+}
+
+/**
+ * Search workspace for preview-able files for the @-mention picker.
+ * `q` is matched against name/path; empty `q` returns the most-recently-modified files.
+ */
+export async function searchWorkspaceFiles(
+  q: string = '',
+  limit: number = 20,
+): Promise<FilesSearchResult> {
+  const params = new URLSearchParams();
+  if (q) params.set('q', q);
+  params.set('limit', String(limit));
+  return fetchJSON(`/api/nanobot/workspace/files?${params.toString()}`);
+}
+
+// ---------------------------------------------------------------------------
+// Workspace Preview
+// ---------------------------------------------------------------------------
+
+export type PreviewBinaryReason = 'office_legacy' | 'archive' | 'unknown';
+
+export type PreviewResult =
+  | {
+      kind: 'text';
+      language: string;
+      content: string;
+      size: number;
+      truncated: boolean;
+      modified: string;
+    }
+  | {
+      kind: 'markdown';
+      content: string;
+      size: number;
+      truncated?: boolean;
+      modified: string;
+    }
+  | { kind: 'json'; content: string; size: number; modified: string }
+  | {
+      kind: 'image';
+      download_url: string;
+      content_type: string;
+      size: number;
+      modified: string;
+    }
+  | { kind: 'pdf'; download_url: string; size: number; modified: string }
+  | { kind: 'html'; download_url: string; size: number; modified: string }
+  | { kind: 'docx'; download_url: string; size: number; modified: string }
+  | { kind: 'xlsx'; download_url: string; size: number; modified: string }
+  | {
+      kind: 'binary';
+      reason: PreviewBinaryReason;
+      size: number;
+      modified: string;
+      download_url: string;
+    };
+
+export async function getWorkspacePreview(path: string): Promise<PreviewResult> {
+  return fetchJSON(`/api/nanobot/workspace/preview?path=${encodeURIComponent(path)}`);
+}
+
+/**
+ * Fetch a workspace download URL (relative path) as a blob URL with auth header attached.
+ * Caller is responsible for `URL.revokeObjectURL` on cleanup.
+ *
+ * The `relPath` argument is the workspace-relative path (same as preview/download `path` param).
+ */
+export async function fetchWorkspaceBlobUrl(relPath: string): Promise<string> {
+  const url = getWorkspaceDownloadUrl(relPath);
+  const token = getAccessToken();
+  const headers: Record<string, string> = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const res = await fetch(url, { headers });
+  if (!res.ok) {
+    throw new Error(`Failed to fetch ${relPath}: ${res.status}`);
+  }
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
+}
+
+/** Fetch a workspace file as ArrayBuffer with auth header attached (for docx/xlsx parsers). */
+export async function fetchWorkspaceArrayBuffer(relPath: string): Promise<ArrayBuffer> {
+  const url = getWorkspaceDownloadUrl(relPath);
+  const token = getAccessToken();
+  const headers: Record<string, string> = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const res = await fetch(url, { headers });
+  if (!res.ok) {
+    throw new Error(`Failed to fetch ${relPath}: ${res.status}`);
+  }
+  return res.arrayBuffer();
+}
+
 export async function uploadToWorkspace(
   file: File,
   dirPath: string = '',

@@ -62,6 +62,10 @@ class AddMarketplaceRequest(BaseModel):
     source: str
 
 
+class CreateArchiveRequest(BaseModel):
+    path: str
+
+
 # ============================================================================
 # App factory
 # ============================================================================
@@ -136,6 +140,17 @@ def create_app(
     app.state.cron_service = cron_service
     app.state.bus = bus
     app.state.web_channel = web_channel  # may be None in standalone
+
+    # Lazy-built workspace watcher (Phase 2). Created on first /ws/files connect.
+    # WebChannel.start() may pre-set a watcher; otherwise we build one on demand.
+    if not hasattr(app.state, "workspace_watcher"):
+        app.state.workspace_watcher = None
+
+    # Purge any leftover archive temp dirs from a previous (possibly crashed)
+    # process before we start serving requests.
+    from nanobot.web import archive as _archive_module
+
+    _archive_module.purge_residue(config.workspace_path)
 
     _register_routes(app)
     return app
@@ -259,6 +274,77 @@ def _register_routes(app: FastAPI) -> None:
 
     # ------ WebSocket ------
 
+    @app.websocket("/ws/files")
+    async def workspace_files_ws(websocket: WebSocket):
+        """Push workspace file events to the client (Phase 2).
+
+        Client may send `{"type":"ping"}`; server replies `{"type":"pong"}`.
+        Server sends `{"type":"snapshot"}` once on connect, then `file_event`
+        payloads for each created/modified/deleted/moved event.
+        """
+        from nanobot.web.watcher import WorkspaceWatcher
+
+        await websocket.accept()
+        logger.debug("workspace files WebSocket connected")
+
+        watcher: WorkspaceWatcher | None = getattr(app.state, "workspace_watcher", None)
+        if watcher is None:
+            # Lazy-construct per-app watcher (standalone / non-WebChannel mode)
+            config_ref: Config = app.state.config
+            watcher = WorkspaceWatcher(config_ref.workspace_path)
+            app.state.workspace_watcher = watcher
+
+        queue = watcher.add_listener()
+
+        # Initial snapshot — tell client to do a fresh browse for state alignment
+        try:
+            await websocket.send_text(json.dumps({"type": "snapshot"}))
+        except Exception:
+            watcher.remove_listener(queue)
+            return
+
+        try:
+            while True:
+                # Concurrently wait for an event from queue OR a client message (ping)
+                queue_task = asyncio.create_task(queue.get())
+                recv_task = asyncio.create_task(websocket.receive_text())
+                done, pending = await asyncio.wait(
+                    [queue_task, recv_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # Cancel pending tasks to avoid leaks
+                for t in pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+                for t in done:
+                    if t is queue_task:
+                        try:
+                            event = t.result()
+                            await websocket.send_text(json.dumps(event))
+                        except Exception:
+                            pass
+                    elif t is recv_task:
+                        try:
+                            raw = t.result()
+                        except Exception:
+                            raise WebSocketDisconnect()
+                        try:
+                            data = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if data.get("type") == "ping":
+                            await websocket.send_text(json.dumps({"type": "pong"}))
+        except WebSocketDisconnect:
+            logger.debug("workspace files WebSocket disconnected")
+        except Exception as e:
+            logger.error(f"workspace files WebSocket error: {e}")
+        finally:
+            watcher.remove_listener(queue)
+
     @app.websocket("/ws/{session_id}")
     async def websocket_endpoint(websocket: WebSocket, session_id: str):
         """WebSocket endpoint for real-time chat.
@@ -337,6 +423,73 @@ def _register_routes(app: FastAPI) -> None:
         finally:
             if web_channel is not None:
                 web_channel.unregister_connection(session_id, websocket)
+        """Push workspace file events to the client (Phase 2).
+
+        Client may send `{"type":"ping"}`; server replies `{"type":"pong"}`.
+        Server sends `{"type":"snapshot"}` once on connect, then `file_event`
+        payloads for each created/modified/deleted/moved event.
+        """
+        from nanobot.web.watcher import WorkspaceWatcher
+
+        await websocket.accept()
+
+        watcher: WorkspaceWatcher | None = getattr(app.state, "workspace_watcher", None)
+        if watcher is None:
+            # Lazy-construct per-app watcher (standalone / non-WebChannel mode)
+            config_ref: Config = app.state.config
+            watcher = WorkspaceWatcher(config_ref.workspace_path)
+            app.state.workspace_watcher = watcher
+
+        queue = watcher.add_listener()
+
+        # Initial snapshot — tell client to do a fresh browse for state alignment
+        try:
+            await websocket.send_text(json.dumps({"type": "snapshot"}))
+        except Exception:
+            watcher.remove_listener(queue)
+            return
+
+        try:
+            while True:
+                # Concurrently wait for an event from queue OR a client message (ping)
+                queue_task = asyncio.create_task(queue.get())
+                recv_task = asyncio.create_task(websocket.receive_text())
+                done, pending = await asyncio.wait(
+                    [queue_task, recv_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # Cancel pending tasks to avoid leaks
+                for t in pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+                for t in done:
+                    if t is queue_task:
+                        try:
+                            event = t.result()
+                            await websocket.send_text(json.dumps(event))
+                        except Exception:
+                            pass
+                    elif t is recv_task:
+                        try:
+                            raw = t.result()
+                        except Exception:
+                            raise WebSocketDisconnect()
+                        try:
+                            data = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if data.get("type") == "ping":
+                            await websocket.send_text(json.dumps({"type": "pong"}))
+        except WebSocketDisconnect:
+            logger.debug("workspace files WebSocket disconnected")
+        except Exception as e:
+            logger.error(f"workspace files WebSocket error: {e}")
+        finally:
+            watcher.remove_listener(queue)
 
     # ------ Sessions ------
 
@@ -738,26 +891,235 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/api/workspace/download")
     async def download_workspace_file(path: str):
-        """Download a file from workspace by relative path."""
-        from nanobot.web.files import workspace_file_path
+        """Download a single workspace file by relative path.
+
+        Directories are no longer zipped here — use POST /api/workspace/archive
+        instead so the work happens off the request thread and the gateway can
+        stream the result.
+        """
+        from nanobot.web.files import _resolve_workspace_path, content_disposition
 
         config: Config = app.state.config
-        file_path = workspace_file_path(config.workspace_path, path)
-        if file_path is None:
-            raise HTTPException(status_code=404, detail="File not found")
+        target = _resolve_workspace_path(config.workspace_path, path)
+        if target is None or not target.exists():
+            raise HTTPException(status_code=404, detail="Path not found")
+
+        if target.is_dir():
+            raise HTTPException(
+                status_code=400,
+                detail="Use POST /api/workspace/archive for directories",
+            )
 
         import mimetypes
         from fastapi.responses import Response
-        from nanobot.web.files import content_disposition
 
-        ct, _ = mimetypes.guess_type(file_path.name)
+        ct, _ = mimetypes.guess_type(target.name)
         ct = ct or "application/octet-stream"
         disposition = "inline" if ct.startswith("image/") else "attachment"
         return Response(
-            content=file_path.read_bytes(),
+            content=target.read_bytes(),
             media_type=ct,
-            headers={"Content-Disposition": content_disposition(disposition, file_path.name)},
+            headers={"Content-Disposition": content_disposition(disposition, target.name)},
         )
+
+    # ------ Workspace folder archive (zip job) ------
+
+    @app.post("/api/workspace/archive", status_code=201)
+    async def create_workspace_archive(body: CreateArchiveRequest):
+        """Create an asynchronous folder-archive job."""
+        from nanobot.web import archive as _archive
+
+        config: Config = app.state.config
+        try:
+            job = _archive.create_job(config.workspace_path, body.path)
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        await _archive.start_job(config.workspace_path, job)
+        return {"job_id": job.job_id, "status": job.status}
+
+    @app.get("/api/workspace/archive/{job_id}")
+    async def get_workspace_archive_status(job_id: str):
+        """Get the status of an archive job."""
+        from nanobot.web import archive as _archive
+
+        job = _archive.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {
+            "status": job.status,
+            "bytes_written": job.bytes_written,
+            "total_bytes_estimate": job.total_bytes_estimate,
+            "error": job.error,
+        }
+
+    @app.get("/api/workspace/archive/{job_id}/download")
+    async def download_workspace_archive(job_id: str):
+        """Stream the completed zip; clean up the job temp dir afterwards."""
+        from fastapi.responses import FileResponse
+        from starlette.background import BackgroundTask
+
+        from nanobot.web import archive as _archive
+        from nanobot.web.files import content_disposition
+
+        job = _archive.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.status != "ready" or job.zip_path is None:
+            raise HTTPException(status_code=409, detail="Archive not ready")
+
+        zip_name = job.zip_path.name
+        return FileResponse(
+            job.zip_path,
+            media_type="application/zip",
+            filename=zip_name,
+            headers={"Content-Disposition": content_disposition("attachment", zip_name)},
+            background=BackgroundTask(_archive.delete_job, job_id),
+        )
+
+    @app.get("/api/workspace/preview")
+    async def preview_workspace_file(path: str):
+        """Return a structured preview payload for a workspace file.
+
+        Response shape varies by ``kind``; see docs/tech-spec-workspace-file-preview.md.
+        Text-based kinds (text/markdown/json) embed content (with 5MB cap).
+        Image/PDF/HTML/docx/xlsx return only ``download_url`` and metadata.
+        Binary returns ``reason`` (office_legacy | archive | unknown) plus download_url.
+        """
+        from datetime import datetime, timezone
+        import mimetypes as _mimetypes
+
+        from nanobot.web.files import _resolve_workspace_path
+        from nanobot.web.preview import (
+            TEXT_PREVIEW_LIMIT,
+            _binary_reason_for,
+            preview_kind_for,
+            pretty_print_json,
+            read_text_safely,
+        )
+
+        config: Config = app.state.config
+        target = _resolve_workspace_path(config.workspace_path, path)
+        if target is None:
+            raise HTTPException(status_code=400, detail="Invalid path")
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        if not target.is_file():
+            raise HTTPException(status_code=400, detail="Not a file")
+
+        stat = target.stat()
+        size = stat.st_size
+        modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+        download_url = f"/api/workspace/download?path={target.relative_to(config.workspace_path.resolve())}"
+
+        kind, language = preview_kind_for(target)
+        ext = target.suffix.lower()
+
+        if kind == "text":
+            content, truncated = read_text_safely(target, TEXT_PREVIEW_LIMIT)
+            return {
+                "kind": "text",
+                "language": language or "plain",
+                "content": content,
+                "size": size,
+                "truncated": truncated,
+                "modified": modified,
+            }
+
+        if kind == "markdown":
+            content, truncated = read_text_safely(target, TEXT_PREVIEW_LIMIT)
+            return {
+                "kind": "markdown",
+                "content": content,
+                "size": size,
+                "truncated": truncated,
+                "modified": modified,
+            }
+
+        if kind == "json":
+            # Too-large JSON: degrade to binary (downloadable)
+            if size > TEXT_PREVIEW_LIMIT:
+                return {
+                    "kind": "binary",
+                    "reason": "unknown",
+                    "size": size,
+                    "modified": modified,
+                    "download_url": download_url,
+                }
+            content, _ = read_text_safely(target, TEXT_PREVIEW_LIMIT)
+            return {
+                "kind": "json",
+                "content": pretty_print_json(content),
+                "size": size,
+                "modified": modified,
+            }
+
+        if kind == "image":
+            ct, _ct_enc = _mimetypes.guess_type(target.name)
+            return {
+                "kind": "image",
+                "download_url": download_url,
+                "content_type": ct or "application/octet-stream",
+                "size": size,
+                "modified": modified,
+            }
+
+        if kind == "pdf":
+            return {
+                "kind": "pdf",
+                "download_url": download_url,
+                "size": size,
+                "modified": modified,
+            }
+
+        if kind == "html":
+            return {
+                "kind": "html",
+                "download_url": download_url,
+                "size": size,
+                "modified": modified,
+            }
+
+        if kind == "docx":
+            return {
+                "kind": "docx",
+                "download_url": download_url,
+                "size": size,
+                "modified": modified,
+            }
+
+        if kind == "xlsx":
+            return {
+                "kind": "xlsx",
+                "download_url": download_url,
+                "size": size,
+                "modified": modified,
+            }
+
+        # binary fallback
+        return {
+            "kind": "binary",
+            "reason": _binary_reason_for(ext),
+            "size": size,
+            "modified": modified,
+            "download_url": download_url,
+        }
+
+    @app.get("/api/workspace/files")
+    async def search_workspace_files_endpoint(q: str = "", limit: int = 20):
+        """Search workspace for preview-able files (used by chat input @-mention).
+
+        Returns top-N candidates ordered by `(rank asc, mtime desc)` where rank
+        favors name-prefix > name-substring > path-prefix > path-substring > fuzzy.
+        Excludes binary files, directories, hidden entries, and noise dirs
+        (.git/node_modules/__pycache__/.venv/venv/dist/build/.next).
+        """
+        from nanobot.web.files import search_workspace_files
+
+        config: Config = app.state.config
+        return search_workspace_files(config.workspace_path, q, limit)
 
     @app.post("/api/workspace/upload")
     async def upload_to_workspace(
