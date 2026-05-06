@@ -68,4 +68,8 @@
 - [x] 8.3 失败场景由后端 `tests/test_archive.py::test_failed_job_keeps_dir_until_ttl` 单测 + 前端 `archiveWorkspacePath` 错误处理（toast `压缩失败：<msg>` 路径）覆盖；nanobot 日志会保留 `failed` job 直到 TTL
 - [x] 8.4 三类全绿：`pytest tests/test_archive.py`（23 通过）、`pytest platform/tests/test_proxy_stream.py`（4 通过）、`npx playwright test tests/e2e/folder-download.spec.ts --headed`（2 通过）
 - [x] 8.5 `CLAUDE.md` 已更新 vendored 补丁表（`nanobot/web/` 行追加 archive 模块说明）
-- [ ] 8.6 git commit —— 暂未自动提交：当前工作树夹杂多处与本变更无关的 prior WIP（`workspace-file-preview` / `mention` 等），自动 `git add -A` 会污染 commit 粒度。建议人工分两次 commit：(a) 先把 prior WIP 各自归并 commit，(b) 再用本变更专属的文件清单（见最终汇报）单独 commit。
+- [x] 8.6 git commit 已完成（按用户选择的方案 A 拆分）：
+  - `22e8deaf` 归并先前 workspace-file-preview / mention 阶段性工作
+  - `a79eedaa` 支持工作区文件夹下载：异步压缩任务 + 流式代理 + 进度提示（本变更）
+  - `44b081fc` 补提交先前 openspec 变更档案
+  - 剩余 untracked 仅为运行产物（`*/test-results/`、`*/playwright-report/`、`workspace/e2e_test_new.md`），按惯例不入库
